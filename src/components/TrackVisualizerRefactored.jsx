@@ -29,6 +29,7 @@ import Visualization from './Visualization.jsx';
 import Tooltip from './Tooltip.jsx';
 import FilterPanel from './FilterPanel.jsx';
 import TempPlaylist from './TempPlaylist.jsx';
+import WaveformPreview from './WaveformPreview.jsx';
 
 // Utils
 import { 
@@ -40,6 +41,193 @@ import {
   PADDING 
 } from '../utils/constants.js';
 import { generateFeatureColors } from '../utils/colorUtils.js';
+
+// Transition path finding utilities
+const calculateTrackCompatibility = (track1, track2) => {
+  let score = 0;
+  let factors = 0;
+
+  // BPM compatibility (±6% rule for beatmatching)
+  if (track1.bpm && track2.bpm) {
+    const bpmDiff = Math.abs(track1.bpm - track2.bpm);
+    const bpmTolerance = Math.max(track1.bpm, track2.bpm) * 0.06;
+    if (bpmDiff <= bpmTolerance) {
+      score += (1 - (bpmDiff / bpmTolerance)) * 0.3; // 30% weight
+    }
+    factors += 0.3;
+  }
+
+  // Key compatibility (Circle of Fifths)
+  if (track1.key && track2.key) {
+    const keyCompatibility = getKeyCompatibility(track1.key, track2.key);
+    score += keyCompatibility * 0.25; // 25% weight
+    factors += 0.25;
+  }
+
+  // Energy compatibility (gradual changes preferred)
+  if (track1.energy !== undefined && track2.energy !== undefined) {
+    const energyDiff = Math.abs(track1.energy - track2.energy);
+    const energyScore = Math.max(0, 1 - (energyDiff / 0.3)); // Prefer <0.3 energy difference
+    score += energyScore * 0.2; // 20% weight
+    factors += 0.2;
+  }
+
+  // Genre/style similarity for bridging
+  const genreSimilarity = calculateGenreSimilarity(track1, track2);
+  score += genreSimilarity * 0.15; // 15% weight
+  factors += 0.15;
+
+  // Spectral similarity (timbre matching)
+  const spectralSimilarity = calculateSpectralSimilarity(track1, track2);
+  score += spectralSimilarity * 0.1; // 10% weight
+  factors += 0.1;
+
+  return factors > 0 ? score / factors : 0;
+};
+
+const getKeyCompatibility = (key1, key2) => {
+  // Simplified key compatibility - same key or relative keys get high scores
+  if (key1 === key2) return 1.0;
+  
+  // Circle of Fifths compatibility mapping
+  const keyMap = {
+    'C': ['G', 'F', 'Am', 'Dm'], 'G': ['D', 'C', 'Em', 'Am'], 'D': ['A', 'G', 'Bm', 'Em'],
+    'A': ['E', 'D', 'F#m', 'Bm'], 'E': ['B', 'A', 'C#m', 'F#m'], 'B': ['F#', 'E', 'G#m', 'C#m'],
+    'F#': ['C#', 'B', 'D#m', 'G#m'], 'C#': ['G#', 'F#', 'A#m', 'D#m'],
+    'F': ['Bb', 'C', 'Dm', 'Gm'], 'Bb': ['Eb', 'F', 'Gm', 'Cm'], 'Eb': ['Ab', 'Bb', 'Cm', 'Fm'],
+    'Ab': ['Db', 'Eb', 'Fm', 'Bbm'], 'Db': ['Gb', 'Ab', 'Bbm', 'Ebm'],
+    // Minor keys
+    'Am': ['Em', 'Dm', 'C', 'F'], 'Em': ['Bm', 'Am', 'G', 'C'], 'Bm': ['F#m', 'Em', 'D', 'G'],
+    'F#m': ['C#m', 'Bm', 'A', 'D'], 'C#m': ['G#m', 'F#m', 'E', 'A'], 'G#m': ['D#m', 'C#m', 'B', 'E'],
+    'D#m': ['A#m', 'G#m', 'F#', 'B'], 'A#m': ['Fm', 'D#m', 'C#', 'F#'],
+    'Dm': ['Gm', 'Am', 'F', 'Bb'], 'Gm': ['Cm', 'Dm', 'Bb', 'Eb'], 'Cm': ['Fm', 'Gm', 'Eb', 'Ab'],
+    'Fm': ['Bbm', 'Cm', 'Ab', 'Db'], 'Bbm': ['Ebm', 'Fm', 'Db', 'Gb'], 'Ebm': ['Abm', 'Bbm', 'Gb', 'B']
+  };
+  
+  const compatibleKeys = keyMap[key1] || [];
+  if (compatibleKeys.includes(key2)) {
+    return 0.8; // High compatibility for related keys
+  }
+  
+  return 0.2; // Low compatibility for unrelated keys
+};
+
+const calculateGenreSimilarity = (track1, track2) => {
+  try {
+    const getTopGenres = (track) => {
+      const styleFeatures = typeof track.style_features === 'string' 
+        ? JSON.parse(track.style_features) : track.style_features;
+      if (!styleFeatures) return [];
+      
+      return Object.entries(styleFeatures)
+        .filter(([, value]) => parseFloat(value) > 0.1)
+        .map(([key, value]) => ({ 
+          genre: key.split('---')[0], 
+          style: key.split('---')[1], 
+          confidence: parseFloat(value) 
+        }))
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, 3);
+    };
+
+    const genres1 = getTopGenres(track1);
+    const genres2 = getTopGenres(track2);
+    
+    if (genres1.length === 0 || genres2.length === 0) return 0.5;
+
+    let maxSimilarity = 0;
+    genres1.forEach(g1 => {
+      genres2.forEach(g2 => {
+        if (g1.genre === g2.genre) {
+          const similarity = Math.min(g1.confidence, g2.confidence);
+          maxSimilarity = Math.max(maxSimilarity, similarity);
+        }
+      });
+    });
+
+    return maxSimilarity;
+  } catch (e) {
+    return 0.5;
+  }
+};
+
+const calculateSpectralSimilarity = (track1, track2) => {
+  const spectralFeatures = ['brightness', 'roughness', 'spectral_centroid', 'spectral_bandwidth'];
+  let similarity = 0;
+  let count = 0;
+
+  spectralFeatures.forEach(feature => {
+    if (track1[feature] !== undefined && track2[feature] !== undefined) {
+      const diff = Math.abs(track1[feature] - track2[feature]);
+      const normalized = Math.max(0, 1 - diff); // Assume features are normalized 0-1
+      similarity += normalized;
+      count++;
+    }
+  });
+
+  return count > 0 ? similarity / count : 0.5;
+};
+
+const findTransitionPath = (startTrack, endTrack, allTracks, maxPathLength = 5) => {
+  if (!startTrack || !endTrack || startTrack.id === endTrack.id) {
+    return [];
+  }
+
+  // Use A* algorithm to find optimal path
+  const openSet = [{ track: startTrack, path: [startTrack], cost: 0 }];
+  const closedSet = new Set();
+  const visited = new Set([startTrack.id]);
+
+  while (openSet.length > 0) {
+    // Sort by total cost (current + heuristic)
+    openSet.sort((a, b) => {
+      const aCost = a.cost + (1 - calculateTrackCompatibility(a.track, endTrack));
+      const bCost = b.cost + (1 - calculateTrackCompatibility(b.track, endTrack));
+      return aCost - bCost;
+    });
+
+    const current = openSet.shift();
+    
+    if (current.track.id === endTrack.id) {
+      return current.path;
+    }
+
+    if (current.path.length >= maxPathLength) {
+      continue;
+    }
+
+    closedSet.add(current.track.id);
+
+    // Find neighboring tracks (high compatibility)
+    const neighbors = allTracks
+      .filter(track => 
+        !closedSet.has(track.id) && 
+        !visited.has(track.id) &&
+        track.id !== current.track.id
+      )
+      .map(track => ({
+        track,
+        compatibility: calculateTrackCompatibility(current.track, track)
+      }))
+      .filter(({ compatibility }) => compatibility > 0.3) // Only consider reasonably compatible tracks
+      .sort((a, b) => b.compatibility - a.compatibility)
+      .slice(0, 10); // Limit search space
+
+    neighbors.forEach(({ track, compatibility }) => {
+      if (!visited.has(track.id)) {
+        visited.add(track.id);
+        openSet.push({
+          track,
+          path: [...current.path, track],
+          cost: current.cost + (1 - compatibility)
+        });
+      }
+    });
+  }
+
+  // If no path found, return direct connection
+  return [startTrack, endTrack];
+};
 
 const TrackVisualizerRefactored = ({
   onPlayTrack,
@@ -124,6 +312,23 @@ const TrackVisualizerRefactored = ({
     clearFn: null
   });
   
+  // Transition path finding state
+  const [transitionMode, setTransitionMode] = useState(false);
+  const [startTrack, setStartTrack] = useState(null);
+  const [endTrack, setEndTrack] = useState(null);
+  const [transitionPath, setTransitionPath] = useState([]);
+  const [pathCompatibilityScores, setPathCompatibilityScores] = useState([]);
+  const transitionModeRef = useRef(false);
+  const startTrackRef = useRef(null);
+  const endTrackRef = useRef(null);
+  
+  // Keep refs in sync with state
+  useEffect(() => {
+    transitionModeRef.current = transitionMode;
+    startTrackRef.current = startTrack;
+    endTrackRef.current = endTrack;
+  }, [transitionMode, startTrack, endTrack]);
+  
   // Filter panel resizing
   const [filterPanelHeight, setFilterPanelHeight] = useState(300);
   const resizeHandlerRef = useRef({
@@ -146,6 +351,38 @@ const TrackVisualizerRefactored = ({
         (track.title || 'Unknown Title');
       
       const filename = track.path ? track.path.split('/').pop().replace(/\.[^/.]+$/, '') : '';
+
+      // Transition mode highlighting
+      if (transitionMode) {
+        if (startTrack && track.id === startTrack.id) {
+          return { id: track.id, color: '#00FF00', isTransitionStart: true }; // Green for start
+        }
+        if (endTrack && track.id === endTrack.id) {
+          return { id: track.id, color: '#FF0000', isTransitionEnd: true }; // Red for end
+        }
+        
+        // Check if track is in transition path
+        const pathIndex = transitionPath.findIndex(pathTrack => pathTrack.id === track.id);
+        if (pathIndex !== -1) {
+          if (pathIndex === 0) {
+            return { id: track.id, color: '#00FF00', isTransitionStart: true }; // Start track
+          } else if (pathIndex === transitionPath.length - 1) {
+            return { id: track.id, color: '#FF0000', isTransitionEnd: true }; // End track
+          } else {
+            // Intermediate tracks - color based on position in path
+            const intensity = 0.3 + (0.7 * pathIndex / (transitionPath.length - 1));
+            return { 
+              id: track.id, 
+              color: `hsl(${120 + (pathIndex * 30)}, 70%, ${50 + intensity * 30}%)`, 
+              isTransitionPath: true,
+              pathIndex 
+            };
+          }
+        }
+        
+        // Dim non-path tracks in transition mode
+        return { id: track.id, color: '#666666', isDimmed: true };
+      }
 
       // Search match highlighting
       const isSearchMatch = searchQuery && (
@@ -255,7 +492,7 @@ const TrackVisualizerRefactored = ({
         };
       }
     });
-  }, [plotData, searchQuery, selectedFeatures, filterLogicMode, highlightThreshold, featureMinMax]);
+  }, [plotData, searchQuery, selectedFeatures, filterLogicMode, highlightThreshold, featureMinMax, transitionMode, startTrack, endTrack, transitionPath]);
 
   // XY mode plot data
   const xyPlotData = useMemo(() => {
@@ -449,8 +686,57 @@ const TrackVisualizerRefactored = ({
   }, []);
 
   const handleTrackClick = useCallback((trackData) => {
-    console.log("Clicked track:", trackData.id, trackData.title);
-  }, []);
+    const isTransitionMode = transitionModeRef.current;
+    const currentStartTrack = startTrackRef.current;
+    const currentEndTrack = endTrackRef.current;
+    console.log("Track clicked - Transition mode:", isTransitionMode, "Track:", trackData.title, "Current start:", currentStartTrack?.title, "Current end:", currentEndTrack?.title);
+    
+    if (isTransitionMode) {
+      if (!currentStartTrack) {
+        // Set as start track
+        setStartTrack(trackData);
+        setEndTrack(null);
+        setTransitionPath([]);
+        setPathCompatibilityScores([]);
+        console.log("Start track selected:", trackData.title);
+      } else if (!currentEndTrack && trackData.id !== currentStartTrack.id) {
+        // Set as end track and calculate path
+        setEndTrack(trackData);
+        console.log("End track selected:", trackData.title, "- Calculating path...");
+        
+        // Calculate transition path
+        const path = findTransitionPath(currentStartTrack, trackData, plotDataToUse, 5);
+        setTransitionPath(path);
+        
+        // Calculate compatibility scores for each transition
+        const scores = [];
+        for (let i = 0; i < path.length - 1; i++) {
+          const score = calculateTrackCompatibility(path[i], path[i + 1]);
+          scores.push(score);
+        }
+        setPathCompatibilityScores(scores);
+        
+        console.log("Transition path found:", path.map(t => t.title));
+        console.log("Compatibility scores:", scores);
+      } else if (trackData.id === currentStartTrack.id) {
+        // Clicked start track again - clear selection
+        setStartTrack(null);
+        setEndTrack(null);
+        setTransitionPath([]);
+        setPathCompatibilityScores([]);
+        console.log("Cleared selection - clicked start track again");
+      } else {
+        // Reset and set new start track
+        setStartTrack(trackData);
+        setEndTrack(null);
+        setTransitionPath([]);
+        setPathCompatibilityScores([]);
+        console.log("Reset and set new start track:", trackData.title);
+      }
+    } else {
+      console.log("Clicked track:", trackData.id, trackData.title);
+    }
+  }, [plotDataToUse]);
 
   // Search functionality
   const generateSuggestions = useCallback((query) => {
@@ -803,6 +1089,31 @@ const TrackVisualizerRefactored = ({
             highlightThreshold={highlightThreshold}
             onHighlightThresholdChange={setHighlightThreshold}
             activeTab="Map"
+            // Transition mode props
+            transitionMode={transitionMode}
+            onTransitionModeToggle={() => {
+              console.log("Toggling transition mode from:", transitionMode, "to:", !transitionMode);
+              const newTransitionMode = !transitionMode;
+              setTransitionMode(newTransitionMode);
+              transitionModeRef.current = newTransitionMode;
+              if (transitionMode) {
+                // Clear transition state when exiting mode
+                setStartTrack(null);
+                setEndTrack(null);
+                setTransitionPath([]);
+                setPathCompatibilityScores([]);
+              }
+            }}
+            startTrack={startTrack}
+            endTrack={endTrack}
+            transitionPath={transitionPath}
+            pathCompatibilityScores={pathCompatibilityScores}
+            onClearTransition={() => {
+              setStartTrack(null);
+              setEndTrack(null);
+              setTransitionPath([]);
+              setPathCompatibilityScores([]);
+            }}
           />
           
           <Visualization
@@ -828,6 +1139,100 @@ const TrackVisualizerRefactored = ({
               onSeek={onSeek}
               onPlayTrack={handlePlayClickPassthrough}
             />
+          )}
+          
+          {/* Transition Path Info Panel */}
+          {transitionMode && transitionPath.length > 0 && (
+            <div className="transition-path-panel">
+              <h3>Transition Path ({transitionPath.length} tracks)</h3>
+              <div className="path-tracks">
+                {transitionPath.map((track, index) => (
+                  <div key={track.id} className="path-track-item">
+                    <div className="track-indicator">
+                      {index === 0 ? '🎵 START' : 
+                       index === transitionPath.length - 1 ? '🏁 END' : 
+                       `${index}`}
+                    </div>
+                    <div className="track-info">
+                      <div className="track-title">{track.title || 'Unknown Title'}</div>
+                      <div className="track-details">
+                        {track.artist && <span>{track.artist}</span>}
+                        {track.bpm && <span>{Math.round(track.bpm)} BPM</span>}
+                        {track.key && <span>{track.key}</span>}
+                        {track.energy && <span>Energy: {(track.energy * 100).toFixed(0)}%</span>}
+                      </div>
+                      
+                      {/* Waveform Preview */}
+                      <div className="track-waveform-preview">
+                        <WaveformPreview
+                          trackId={track.id}
+                          isPlaying={currentPlayingTrackId === track.id && isAudioPlaying}
+                          currentTime={currentPlayingTrackId === track.id ? currentTime : 0}
+                          onSeek={currentPlayingTrackId === track.id ? onSeek : null}
+                          onPlayClick={() => handlePlayClickPassthrough(track)}
+                          height={25}
+                          waveColor="#666666"
+                          progressColor="#4CAF50"
+                        />
+                      </div>
+                    </div>
+                    {index < pathCompatibilityScores.length && (
+                      <div className="compatibility-score">
+                        <div className="score-bar">
+                          <div 
+                            className="score-fill"
+                            style={{ 
+                              width: `${pathCompatibilityScores[index] * 100}%`,
+                              backgroundColor: pathCompatibilityScores[index] > 0.7 ? '#4CAF50' :
+                                               pathCompatibilityScores[index] > 0.5 ? '#FF9800' : '#F44336'
+                            }}
+                          />
+                        </div>
+                        <span className="score-text">
+                          {(pathCompatibilityScores[index] * 100).toFixed(0)}% match
+                        </span>
+                      </div>
+                    )}
+                    {index < transitionPath.length - 1 && (
+                      <div className="transition-arrow">↓</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="path-actions">
+                <button 
+                  className="play-path-btn"
+                  onClick={() => {
+                    // Play first track in path
+                    if (transitionPath.length > 0 && onPlayTrack) {
+                      console.log("Playing path starting with:", transitionPath[0].title);
+                      handlePlayClickPassthrough(transitionPath[0]);
+                    }
+                  }}
+                >
+                  ▶ Play Path
+                </button>
+                <button 
+                  className="export-path-btn"
+                  onClick={() => {
+                    const pathData = transitionPath.map((track, index) => ({
+                      position: index + 1,
+                      title: track.title || 'Unknown Title',
+                      artist: track.artist || '',
+                      bpm: track.bpm || '',
+                      key: track.key || '',
+                      energy: track.energy || '',
+                      compatibility: index < pathCompatibilityScores.length ? 
+                        pathCompatibilityScores[index] : null
+                    }));
+                    console.log('Transition Path Data:', pathData);
+                    // Could implement CSV export or playlist creation here
+                  }}
+                >
+                  📋 Export Path
+                </button>
+              </div>
+            </div>
           )}
         </div>
       </div>
